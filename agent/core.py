@@ -54,6 +54,9 @@ OLLAMA_MODEL    = "qwen3-coder-next:cloud"  # chat model
 OLLAMA_EMBED    = "nomic-embed-text"         # embedding model (Chapter 9)
 REPO_ROOT       = "."                        # default project directory
 TOKEN_BUDGET    = 262144                     # context-window size in tokens
+# Ollama returns 400 if num_ctx exceeds the model's context window.
+# Use a conservative default unless overridden via env.
+SAFE_NUM_CTX    = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
 REBUILD_INDEX   = False
 
 # Files the agent will read and embed — extend as needed
@@ -114,7 +117,7 @@ def chat(
         "model":   model,
         "messages": messages,
         "stream":  False,
-        "options": {"num_ctx": TOKEN_BUDGET},
+        "options": {"num_ctx": min(TOKEN_BUDGET, SAFE_NUM_CTX)},
     }
     r = requests.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload, timeout=120)
     r.raise_for_status()
@@ -143,7 +146,7 @@ def chat_stream(
         "model":   model,
         "messages": messages,
         "stream":  True,
-        "options": {"num_ctx": TOKEN_BUDGET},
+        "options": {"num_ctx": min(TOKEN_BUDGET, SAFE_NUM_CTX)},
     }
     with requests.post(
         f"{OLLAMA_BASE_URL}/api/chat",
@@ -157,6 +160,79 @@ def chat_stream(
                 data = json.loads(line)
                 if not data.get("done", False):
                     yield data["message"]["content"]
+
+
+def chat_stream_state(
+    messages: list[dict],
+    model: str = OLLAMA_MODEL,
+):
+    """
+    Stream tokens like chat_stream(), but also expose done_reason via state.
+    Returns (generator, state_dict).
+    """
+    state = {"done_reason": None}
+
+    def _gen():
+        payload = {
+            "model":   model,
+            "messages": messages,
+            "stream":  True,
+            "options": {"num_ctx": min(TOKEN_BUDGET, SAFE_NUM_CTX)},
+        }
+        with requests.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json=payload,
+            stream=True,
+            timeout=120,
+        ) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if not line:
+                    continue
+                data = json.loads(line)
+                if data.get("done", False):
+                    state["done_reason"] = data.get("done_reason", "stop")
+                    continue
+                yield data["message"]["content"]
+
+    return _gen(), state
+
+
+def chat_continued(
+    messages:          list[dict],
+    model:             str = OLLAMA_MODEL,
+    max_continuations: int = 4,
+) -> tuple[str, int]:
+    """
+    Like chat(), but automatically continues if Ollama stops early due to
+    token limits (done_reason == "length").  Appends the partial reply as an
+    assistant turn and sends "Continue." until the model signals "stop" or
+    max_continuations is exhausted.
+    """
+    full_reply   = ""
+    total_tokens = 0
+    msgs         = list(messages)
+    for turn in range(max_continuations + 1):
+        payload = {
+            "model":    model,
+            "messages": msgs,
+            "stream":   False,
+            "options":  {"num_ctx": min(TOKEN_BUDGET, SAFE_NUM_CTX)},
+        }
+        r = requests.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload, timeout=180)
+        r.raise_for_status()
+        data         = r.json()
+        chunk        = data["message"]["content"]
+        full_reply  += chunk
+        total_tokens += data.get("prompt_eval_count", 0) + data.get("eval_count", 0)
+        if data.get("done_reason", "stop") != "length":
+            break
+        if turn < max_continuations:
+            msgs = msgs + [
+                {"role": "assistant", "content": chunk},
+                {"role": "user",      "content": "Continue."},
+            ]
+    return full_reply, total_tokens
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -270,7 +346,7 @@ def ask_with_manifest(
         {"role": "system", "content": system_content},
         {"role": "user",   "content": query + file_block},
     ]
-    reply, tokens_used = chat(messages)
+    reply, tokens_used = chat_continued(messages)
     return reply, tokens_used
 
 
@@ -823,7 +899,7 @@ def apply_patch(
         f"INSTRUCTION: {instruction}\n\n"
         f"FILE: {rel}\n```\n{original}\n```"
     )
-    proposed_raw, _ = chat([{"role": "user", "content": prompt}])
+    proposed_raw, _ = chat_continued([{"role": "user", "content": prompt}])
     proposed = re.sub(r"^```[a-zA-Z]*\n?", "", proposed_raw.strip())
     proposed = re.sub(r"\n?```$", "", proposed)
     return original, proposed.strip() + "\n"
@@ -891,7 +967,7 @@ def plan_task(task: str, repo_root: str = REPO_ROOT) -> list[dict]:
     """
     manifest = load_manifest(repo_root)
     prompt   = f"PROJECT MAP:\n{manifest['text']}\n\nTASK: {task}"
-    raw, _   = chat([
+    raw, _   = chat_continued([
         {"role": "system", "content": _PLAN_SYSTEM},
         {"role": "user",   "content": prompt},
     ])
@@ -1021,7 +1097,7 @@ def generate_tests(source_path: str, repo_root: str = REPO_ROOT) -> str:
         f"- Return ONLY the test file — no explanation, no markdown fences\n\n"
         f"SOURCE FILE: {source_path}\n\n{source}"
     )
-    raw, _ = chat([{"role": "user", "content": prompt}])
+    raw, _ = chat_continued([{"role": "user", "content": prompt}])
     code   = re.sub(r"^```[a-zA-Z]*\n?", "", raw.strip())
     code   = re.sub(r"\n?```$", "", code)
     return code.strip() + "\n"

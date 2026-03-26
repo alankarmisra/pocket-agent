@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from core import (
     OLLAMA_MODEL, OLLAMA_EMBED, OLLAMA_BASE_URL,
     TOKEN_BUDGET, REPO_ROOT,
-    retrieve, chat_stream,
+    retrieve, chat_stream, chat_stream_state,
     plan_task, execute_step,
     load_manifest,
 )
@@ -49,6 +49,8 @@ code { font-size: 0.82rem; }
 .diff-box .add  { color: #3fb950; }
 .diff-box .del  { color: #f85149; }
 .diff-box .meta { color: #8b949e; }
+/* scroll anchor for agent log */
+#agent-log-anchor { margin-bottom: 1px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -65,6 +67,10 @@ def _init_state():
         "agent_plan":  [],
         "agent_step":  0,
         "agent_log":   [],          # list of strings
+        "agent_history": [],        # list of {"task", "log"}
+        "agent_done_archived": False,
+        "agent_task_input": "",
+        "agent_reset_input": False,
         "pending_patch": None,      # {"file_path", "new_content", "diff"}
     }
     for k, v in defaults.items():
@@ -144,8 +150,16 @@ with tab_ask:
                     for f in msg["files"]:
                         st.code(f, language=None)
 
-    # Chat input at the bottom
-    if query := st.chat_input("Ask anything about your code…"):
+    # Ask input (Cmd/Ctrl+Enter to submit)
+    with st.form("ask_form", clear_on_submit=True):
+        query = st.text_area(
+            "Ask anything about your code…",
+            placeholder="e.g. Where is JSON parsing handled?",
+            height=80,
+        )
+        ask_clicked = st.form_submit_button("▶  Ask", type="primary")
+
+    if ask_clicked and query.strip():
         repo = st.session_state.repo_root
 
         # Show user bubble immediately
@@ -208,19 +222,40 @@ with tab_agent:
 
     repo = st.session_state.repo_root
 
+    # Render agent history first
+    if st.session_state.agent_history:
+        st.divider()
+        st.subheader("Agent history")
+        for i, item in enumerate(st.session_state.agent_history, 1):
+            st.markdown(f"**#{i}: {item['task']}**")
+            for line in item["log"]:
+                st.markdown(line)
+            st.markdown("---")
+
     # ── State: idle — show task input ──────────────────────────────────────────
     if st.session_state.agent_state == "idle":
-        task = st.text_area(
-            "Task",
-            placeholder="e.g. Add a --verbose flag to main.py that prints each step",
-            height=120,
-        )
-        if st.button("▶  Run agent", type="primary", disabled=not task.strip()):
+        if st.session_state.agent_reset_input:
+            st.session_state.agent_task_input = ""
+            st.session_state.agent_reset_input = False
+        with st.form("agent_run_form", clear_on_submit=True):
+            task = st.text_area(
+                "Task",
+                placeholder="e.g. Add a --verbose flag to main.py that prints each step",
+                height=120,
+                key="agent_task_input",
+            )
+            run_clicked = st.form_submit_button(
+                "▶  Run agent",
+                type="primary",
+            )
+
+        if run_clicked and task.strip():
             st.session_state.agent_task  = task.strip()
             st.session_state.agent_state = "planning"
             st.session_state.agent_log   = []
             st.session_state.agent_step  = 0
             st.session_state.agent_plan  = []
+            st.session_state.agent_done_archived = False
             st.rerun()
 
     # ── State: planning — call plan_task ───────────────────────────────────────
@@ -257,7 +292,32 @@ with tab_agent:
 
             with st.spinner(f"Step {idx+1}/{len(plan)}: {step_desc}"):
                 try:
-                    result = execute_step(step, repo_root=repo)
+                    action = step.get("action", "read")
+                    if action == "read":
+                        # Stream the read reply with continuation if needed
+                        query = step.get("target", "")
+                        messages, loaded_files, strategy, total_tokens, compact_log = retrieve(
+                            query, repo_root=repo
+                        )
+
+                        full_reply = ""
+                        msgs = list(messages)
+                        max_cont = 4
+                        for turn in range(max_cont + 1):
+                            gen, state = chat_stream_state(msgs)
+                            chunk = st.write_stream(gen)
+                            full_reply += chunk
+                            if state.get("done_reason", "stop") != "length":
+                                break
+                            if turn < max_cont:
+                                msgs = msgs + [
+                                    {"role": "assistant", "content": chunk},
+                                    {"role": "user", "content": "Continue."},
+                                ]
+
+                        result = {"type": "read", "output": full_reply}
+                    else:
+                        result = execute_step(step, repo_root=repo)
                     if result.get("type") == "write":
                         # Pause and ask user to confirm before touching disk
                         st.session_state.pending_patch = {
@@ -285,15 +345,34 @@ with tab_agent:
                         )
                         st.session_state.agent_step += 1
                     else:
-                        # read — log a preview and continue
+                        # read — log preview; include full output if long
                         output = result.get("output", "")
-                        st.session_state.agent_log.append(
-                            f"   ✅ {output[:300]}{'…' if len(output) > 300 else ''}"
-                        )
+                        preview = output[:300] + ("…" if len(output) > 300 else "")
+                        st.session_state.agent_log.append(f"   ✅ {preview}")
+                        if len(output) > 300:
+                            st.session_state.agent_log.append(
+                                "   ```\n" + output + "\n   ```"
+                            )
                         st.session_state.agent_step += 1
                 except Exception as e:
                     st.session_state.agent_log.append(f"   ❌ Error: {e}")
                     st.session_state.agent_step += 1
+            
+            # Auto-scroll to bottom using JavaScript
+            st.markdown("""
+<script>
+    try {
+        const logs = window.parent.document.querySelectorAll('.streamlit-expander, .stMarkdown');
+        const lastLog = logs[logs.length - 1];
+        if (lastLog && lastLog.closest('details')) {
+            lastLog.closest('details').scrollIntoView({ behavior: 'smooth', block: 'end' });
+        } else {
+            const anchor = document.getElementById('agent-log-anchor');
+            if (anchor) anchor.scrollIntoView({ behavior: 'smooth', block: 'end' });
+        }
+    } catch(e) {}
+</script>
+""", unsafe_allow_html=True)
             st.rerun()
 
     # ── State: waiting_confirm — show diff, ask user ───────────────────────────
@@ -308,8 +387,29 @@ with tab_agent:
     if st.session_state.agent_log or st.session_state.agent_state != "idle":
         st.divider()
         st.subheader("Activity log")
-        for line in st.session_state.agent_log:
-            st.markdown(line)
+        # Render anchor for auto-scrolling
+        st.markdown('<div id="agent-log-anchor"></div>', unsafe_allow_html=True)
+        
+        if st.session_state.agent_task:
+            st.markdown(f"**Task:** {st.session_state.agent_task}")
+        
+        # Use st.container for last element scroll target
+        log_container = st.container()
+        with log_container:
+            for line in st.session_state.agent_log:
+                st.markdown(line)
+        
+        # Immediately after rendering, scroll to the container
+        st.markdown("""
+<script>
+    try {
+        const container = window.parent.document.querySelector('.stContainer:last-of-type');
+        if (container) {
+            container.scrollIntoView({ behavior: 'auto', block: 'end' });
+        }
+    } catch(e) {}
+</script>
+""", unsafe_allow_html=True)
 
     # ── Render diff confirm panel (outside the elif so it repaints correctly) ──
     if st.session_state.agent_state == "waiting_confirm":
@@ -359,12 +459,19 @@ with tab_agent:
                 st.session_state.agent_state   = "executing"
                 st.rerun()
 
-    # ── Done banner ────────────────────────────────────────────────────────────
+    # ── Done → archive and return to idle ─────────────────────────────────────
     if st.session_state.agent_state == "done":
-        st.success("Agent finished all steps.")
-        if st.button("Start new task"):
-            st.session_state.agent_state = "idle"
-            st.session_state.agent_log   = []
-            st.session_state.agent_plan  = []
-            st.session_state.agent_step  = 0
-            st.rerun()
+        if not st.session_state.agent_done_archived:
+            if st.session_state.agent_log or st.session_state.agent_task:
+                st.session_state.agent_history.append({
+                    "task": st.session_state.agent_task,
+                    "log":  list(st.session_state.agent_log),
+                })
+            st.session_state.agent_done_archived = True
+        st.session_state.agent_state = "idle"
+        st.session_state.agent_log   = []
+        st.session_state.agent_plan  = []
+        st.session_state.agent_step  = 0
+        st.session_state.agent_task  = ""
+        st.session_state.agent_reset_input = True
+        st.rerun()

@@ -172,3 +172,8 @@ These are read-only, no-dependency scripts useful for understanding the concepts
 ## License
 
 MIT
+
+---
+
+> **Ready to start?**  
+> Feel free to open and explore the notebook interactively — run each chapter step by step, modify the code, and follow along to build your own agent from scratch. You’ll gain deep insight into how real-world coding agents operate while staying in full control.

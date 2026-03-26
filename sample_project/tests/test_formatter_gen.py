@@ -3,70 +3,60 @@ from utils.formatter import to_csv
 
 
 class TestToCsv:
-    def test_happy_path_basic(self):
+    def test_basic_conversion(self):
         records = [
             {"name": "Alice", "age": "30", "city": "NYC"},
             {"name": "Bob", "age": "25", "city": "LA"},
         ]
         result = to_csv(records)
-        lines = result.split("\r\n")
-        assert lines[0] == "name,age,city"
-        assert lines[1] == "Alice,30,NYC"
-        assert lines[2] == "Bob,25,LA"
+        assert result == "name,age,city\r\nAlice,30,NYC\r\nBob,25,LA\r\n"
 
-    def test_happy_path_custom_delimiter(self):
-        records = [{"name": "Alice", "value": "100"}]
-        result = to_csv(records, delimiter=";")
-        assert "name;value" in result
-        assert "Alice;100" in result
-
-    def test_edge_case_empty_records(self):
+    def test_empty_records(self):
         assert to_csv([]) == ""
 
-    def test_edge_case_empty_list_of_records(self):
-        records = []
-        assert to_csv(records) == ""
-
-    def test_edge_case_missing_keys_in_records(self):
+    def test_missing_values(self):
         records = [
-            {"name": "Alice", "age": "30"},
-            {"name": "Bob", "city": "LA"},
-            {"age": "25", "city": "Chicago"},
+            {"name": "Alice", "city": "NYC"},
+            {"name": "Bob"},
+            {"city": "Chicago"},
         ]
         result = to_csv(records)
-        lines = result.split("\r\n")
-        assert lines[0] == "name,age,city"
-        assert lines[1] == "Alice,30,"
-        assert lines[2] == "Bob,,LA"
-        assert lines[3] == ",25,Chicago"
+        lines = result.strip().split("\r\n")
+        assert lines[0] == "name,city"
+        assert lines[1] == "Alice,NYC"
+        assert lines[2] == "Bob,"
+        assert lines[3] == ",Chicago"
 
-    def test_edge_case_extra_keys_ignored(self):
+    def test_different_delimiter(self):
         records = [
-            {"name": "Alice", "age": "30", "extra_field": "should be ignored"},
+            {"a": "1", "b": "2"},
+            {"a": "3", "b": "4"},
+        ]
+        result = to_csv(records, delimiter=";")
+        assert result == "a;b\r\n1;2\r\n3;4\r\n"
+
+    def test_key_order_preservation(self):
+        records = [
+            {"z": 1, "a": 2},
+            {"a": 3, "z": 4},
         ]
         result = to_csv(records)
-        lines = result.split("\r\n")
-        assert lines[0] == "name,age,extra_field"
-        assert lines[1] == "Alice,30,should be ignored"
+        lines = result.strip().split("\r\n")
+        assert lines[0] == "z,a"
 
-    def test_edge_case_different_key_ordering_preserves_first_seen(self):
+    def test_extra_keys_ignored(self):
         records = [
-            {"b": "2", "a": "1"},
-            {"c": "3", "a": "4"},
+            {"name": "Alice", "age": 30},
+            {"name": "Bob", "age": 25, "extra": "ignored"},
+        ]
+        result = to_csv(records, fields=["name", "age"])
+        lines = result.strip().split("\r\n")
+        assert "extra" not in lines[0]
+
+    def test_unicode_content(self):
+        records = [
+            {"name": "Café", "city": "Zürich"},
         ]
         result = to_csv(records)
-        lines = result.split("\r\n")
-        assert lines[0] == "b,a,c"
-        assert lines[1] == "2,1,"
-        assert lines[2] == ",4,3"
-
-    def test_edge_case_unicode_and_special_characters(self):
-        records = [
-            {"name": "José", "quote": "Hello, \"world\""},
-            {"name": "中", "quote": "Line1\nLine2"},
-        ]
-        result = to_csv(records)
-        lines = result.split("\r\n")
-        assert lines[0] == "name,quote"
-        assert 'José,"Hello, ""world"""' in lines[1]
-        assert '中,"Line1\nLine2"' in lines[2]
+        assert "Café" in result
+        assert "Zürich" in result

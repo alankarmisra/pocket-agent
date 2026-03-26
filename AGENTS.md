@@ -29,6 +29,6 @@ Each chapter adds one capability. The notebook IS the source of truth.
 - `__pycache__/` — compiled bytecode
 - `*.ipynb_checkpoints/` — Jupyter autosave noise
 
-## Questions about token budgeting → Chapter 2
+## Questions about token budgeting → Chapter 3
 ## Questions about retrieval strategy → Chapters 4–8
-## Questions about the agent loop → Chapter 11
+## Questions about the agent loop → Chapter 12

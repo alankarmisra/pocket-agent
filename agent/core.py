@@ -107,24 +107,37 @@ def ping_ollama() -> tuple[bool, list[str] | str]:
 
 def chat(
     messages: list[dict],
-    model: str = OLLAMA_MODEL,
+    model:    str = OLLAMA_MODEL,
 ) -> tuple[str, int]:
     """
     Send *messages* to Ollama, return (reply_text, tokens_used).
-    tokens_used is the sum of prompt and completion tokens as reported by Ollama.
+
+    If Ollama stops early (done_reason == "length") the reply is automatically
+    continued until the model signals "stop".
     """
-    payload = {
-        "model":   model,
-        "messages": messages,
-        "stream":  False,
-        "options": {"num_ctx": min(TOKEN_BUDGET, SAFE_NUM_CTX)},
-    }
-    r = requests.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload, timeout=120)
-    r.raise_for_status()
-    data   = r.json()
-    reply  = data["message"]["content"]
-    tokens = data.get("prompt_eval_count", 0) + data.get("eval_count", 0)
-    return reply, tokens
+    full_reply   = ""
+    total_tokens = 0
+    msgs         = list(messages)
+    while True:
+        payload = {
+            "model":    model,
+            "messages": msgs,
+            "stream":   False,
+            "options":  {"num_ctx": min(TOKEN_BUDGET, SAFE_NUM_CTX)},
+        }
+        r = requests.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload, timeout=180)
+        r.raise_for_status()
+        data         = r.json()
+        chunk        = data["message"]["content"]
+        full_reply  += chunk
+        total_tokens += data.get("prompt_eval_count", 0) + data.get("eval_count", 0)
+        if data.get("done_reason", "stop") != "length":
+            break
+        msgs = msgs + [
+            {"role": "assistant", "content": chunk},
+            {"role": "user",      "content": "Continue."},
+        ]
+    return full_reply, total_tokens
 
 
 def chat_stream(
@@ -198,41 +211,6 @@ def chat_stream_state(
     return _gen(), state
 
 
-def chat_continued(
-    messages:          list[dict],
-    model:             str = OLLAMA_MODEL,
-    max_continuations: int = 4,
-) -> tuple[str, int]:
-    """
-    Like chat(), but automatically continues if Ollama stops early due to
-    token limits (done_reason == "length").  Appends the partial reply as an
-    assistant turn and sends "Continue." until the model signals "stop" or
-    max_continuations is exhausted.
-    """
-    full_reply   = ""
-    total_tokens = 0
-    msgs         = list(messages)
-    for turn in range(max_continuations + 1):
-        payload = {
-            "model":    model,
-            "messages": msgs,
-            "stream":   False,
-            "options":  {"num_ctx": min(TOKEN_BUDGET, SAFE_NUM_CTX)},
-        }
-        r = requests.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload, timeout=180)
-        r.raise_for_status()
-        data         = r.json()
-        chunk        = data["message"]["content"]
-        full_reply  += chunk
-        total_tokens += data.get("prompt_eval_count", 0) + data.get("eval_count", 0)
-        if data.get("done_reason", "stop") != "length":
-            break
-        if turn < max_continuations:
-            msgs = msgs + [
-                {"role": "assistant", "content": chunk},
-                {"role": "user",      "content": "Continue."},
-            ]
-    return full_reply, total_tokens
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -346,7 +324,7 @@ def ask_with_manifest(
         {"role": "system", "content": system_content},
         {"role": "user",   "content": query + file_block},
     ]
-    reply, tokens_used = chat_continued(messages)
+    reply, tokens_used = chat(messages)
     return reply, tokens_used
 
 
@@ -899,7 +877,7 @@ def apply_patch(
         f"INSTRUCTION: {instruction}\n\n"
         f"FILE: {rel}\n```\n{original}\n```"
     )
-    proposed_raw, _ = chat_continued([{"role": "user", "content": prompt}])
+    proposed_raw, _ = chat([{"role": "user", "content": prompt}])
     proposed = re.sub(r"^```[a-zA-Z]*\n?", "", proposed_raw.strip())
     proposed = re.sub(r"\n?```$", "", proposed)
     return original, proposed.strip() + "\n"
@@ -967,7 +945,7 @@ def plan_task(task: str, repo_root: str = REPO_ROOT) -> list[dict]:
     """
     manifest = load_manifest(repo_root)
     prompt   = f"PROJECT MAP:\n{manifest['text']}\n\nTASK: {task}"
-    raw, _   = chat_continued([
+    raw, _   = chat([
         {"role": "system", "content": _PLAN_SYSTEM},
         {"role": "user",   "content": prompt},
     ])
@@ -1097,7 +1075,7 @@ def generate_tests(source_path: str, repo_root: str = REPO_ROOT) -> str:
         f"- Return ONLY the test file — no explanation, no markdown fences\n\n"
         f"SOURCE FILE: {source_path}\n\n{source}"
     )
-    raw, _ = chat_continued([{"role": "user", "content": prompt}])
+    raw, _ = chat([{"role": "user", "content": prompt}])
     code   = re.sub(r"^```[a-zA-Z]*\n?", "", raw.strip())
     code   = re.sub(r"\n?```$", "", code)
     return code.strip() + "\n"
@@ -1153,3 +1131,27 @@ def test_loop(
 
     result["attempts"] = max_retries + 1
     return result
+
+
+import platform
+
+def notify(message: str, title: str = "Pocket Agent") -> dict:
+    """Send a desktop notification on macOS, Linux, or Windows. Returns {"ok": bool, "error": str|None}"""
+    try:
+        system = platform.system()
+        if system == "Darwin":
+            subprocess.run(
+                ["osascript", "-e", f'display notification "{message}" with title "{title}"'],
+                check=True,
+            )
+        elif system == "Linux":
+            subprocess.run(["notify-send", title, message], check=True)
+        elif system == "Windows":
+            subprocess.run(
+                ["powershell", "-Command",
+                 f'[System.Windows.Forms.MessageBox]::Show("{message}", "{title}")'],
+                check=True,
+            )
+        return {"ok": True, "error": None}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
